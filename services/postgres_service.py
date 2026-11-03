@@ -13848,12 +13848,48 @@ SELECT json_build_object(
 
         source_schema_name = prepared["source_schema_name"]
         source_table_name = prepared["source_table_name"]
+        scope_key = hashlib.sha256(json.dumps(
+            [database_name, source_schema_name, source_table_name, list(prepared["raw_schemas"]),
+             [[d["table_name"], d["sql_recipe"]] for d in prepared["destinations"]]],
+            ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
         with self.expansion_timing_scope(
             timing_report,
             "preflight",
-            "Detect server parallelism",
+            "Load expansion job journal (resume point)",
         ):
-            ranges = self._expand_parallel_ranges()
+            journal_output = self.run_remote_command(
+                f"psql -h localhost -U {shlex.quote(self.sql_username)} -d {shlex.quote(database_name)} "
+                "-X -qAt -v ON_ERROR_STOP=1 -f -",
+                stdin_text="SET client_min_messages = warning;\n" + parallel_expansion.journal_lookup_sql(),
+                cancel_event=cancel_event,
+            )
+        unfinished = []
+        for line in journal_output.splitlines():
+            if line.strip().startswith("{") and "pgdm_unfinished_jobs" in line:
+                unfinished = json.loads(line).get("pgdm_unfinished_jobs") or []
+        other = [job for job in unfinished if job.get("scope_key") != scope_key]
+        if other:
+            raise RuntimeError(
+                "Another expansion of this database was interrupted and has not finished "
+                f"(job {other[0]['job_id']}, status {other[0]['status']}). Re-run that same "
+                "expansion to resume it, or delete its row from public.pgdm_expansion_jobs "
+                "to discard it."
+            )
+        resumed = next((job for job in unfinished if job.get("scope_key") == scope_key), None)
+        if resumed:
+            job_id, tag, ranges = resumed["job_id"], resumed["tag"], int(resumed["ranges"])
+            self._notify_progress(progress_callback, "execute", 2,
+                                  f"Resuming interrupted expansion job {job_id} ({resumed['status']})...")
+        else:
+            job_id = f"{time.strftime('%Y%m%d%H%M%S')}-{hashlib.sha1(scope_key.encode()).hexdigest()[:8]}"
+            tag = hashlib.sha1((job_id + scope_key).encode()).hexdigest()[:8]
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Detect server parallelism",
+            ):
+                ranges = self._expand_parallel_ranges()
         with self.expansion_timing_scope(
             timing_report,
             "prepare",
@@ -13874,6 +13910,9 @@ SELECT json_build_object(
                     source_table_name,
                     prepared["raw_schemas"],
                 ),
+                job_id=job_id,
+                tag=tag,
+                scope_key=scope_key,
             )
         self._notify_progress(
             progress_callback,
@@ -13949,7 +13988,19 @@ SELECT json_build_object(
             "dependency_manifest": manifest,
             "destinations": prepared["destinations"],
             "timing_report": timing_report,
+            "expansion_job": {"job_id": job_id, "tag": tag, "resumed": bool(resumed),
+                              "status": (resumed or {}).get("status"),
+                              "data_committed_at": (resumed or {}).get("data_committed_at")},
         }
+
+    def _finish_expansion_job(self, database_name: str, job: dict) -> None:
+        from services import parallel_expansion
+
+        self.run_remote_command(
+            f"psql -h localhost -U {shlex.quote(self.sql_username)} -d {shlex.quote(database_name)} "
+            "-X -qAt -v ON_ERROR_STOP=1 -f -",
+            stdin_text=parallel_expansion.finish_job_sql(job["job_id"], job["tag"]),
+        )
 
     def execute_cross_table_expansion(
         self,
@@ -15127,6 +15178,64 @@ COMMIT;
         )
 
     def register_cross_table_expansion_versions(
+        self,
+        expansion_result: dict,
+        requested_by: str,
+        workstation_name: str,
+        progress_callback=None,
+        cancel_event=None,
+        timing_report: dict | None = None,
+    ) -> list[dict]:
+        job = (expansion_result or {}).get("expansion_job")
+        database_name = str((expansion_result or {}).get("source_database_name") or "").strip()
+        if job and job.get("status") == "data_committed" and job.get("data_committed_at"):
+            # Resumed after the data commit: the interrupted run may already have
+            # registered the versions. Never register them twice.
+            existing = self._expansion_versions_registered_since(
+                database_name, expansion_result.get("destinations") or [], job["data_committed_at"])
+            if existing is not None:
+                self._finish_expansion_job(database_name, job)
+                self._notify_progress(progress_callback, "version", 100,
+                                      f"{len(existing)} version(s) were already registered by the interrupted run.")
+                return existing
+        registered = self._register_cross_table_expansion_versions_core(
+            expansion_result=expansion_result,
+            requested_by=requested_by,
+            workstation_name=workstation_name,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            timing_report=timing_report,
+        )
+        if job:
+            if timing_report is None:
+                timing_report = (expansion_result or {}).get("timing_report")
+            with self.expansion_timing_scope(timing_report, "version", "Close expansion job journal"):
+                self._finish_expansion_job(database_name, job)
+        return registered
+
+    def _expansion_versions_registered_since(self, database_name, destinations, since):
+        rows = []
+        for destination in destinations:
+            schema_name, table_name = destination["schema_name"], destination["pure_table_name"]
+            sql = (
+                "SELECT json_build_object('table_name', schema_name || '.' || table_name, "
+                "'version_code', version_code, 'version_title', version_title)::text "
+                f"FROM {sql_ident(CONTROL_SCHEMA)}.table_versions "
+                f"WHERE database_name = {sql_literal(database_name)} AND schema_name = {sql_literal(schema_name)} "
+                f"AND table_name = {sql_literal(table_name)} AND operation_kind = 'cross_table_expand_v1' "
+                f"AND sql_recipe = {sql_literal(destination['sql_recipe'])} "
+                f"AND created_at >= {sql_literal(str(since))}::timestamptz ORDER BY version_code DESC LIMIT 1;"
+            )
+            output = self.run_remote_command(
+                f"psql -h localhost -U {shlex.quote(self.sql_username)} -d {shlex.quote(CONTROL_DB)} -X -qAt -v ON_ERROR_STOP=1 -f -",
+                stdin_text=sql,
+            ).strip()
+            if not output.startswith("{"):
+                return None
+            rows.append(json.loads(output.splitlines()[0]))
+        return rows
+
+    def _register_cross_table_expansion_versions_core(
         self,
         expansion_result: dict,
         requested_by: str,

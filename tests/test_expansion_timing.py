@@ -144,6 +144,9 @@ class ExpansionTimingTests(unittest.TestCase):
             patch.object(service, "get_table_row_count", return_value=0),
             patch.object(service, "_validate_managed_sql_dependencies"),
             patch.object(service, "run_remote_command", side_effect=fake_remote_command),
+            # This test pins the legacy single-transaction batch; the parallel
+            # engine is covered by tests/test_parallel_expansion.py.
+            patch("services.postgres_service.EXPAND_ENGINE", "legacy"),
         ):
             result = service.execute_cross_table_expansion(
                 "challenge",

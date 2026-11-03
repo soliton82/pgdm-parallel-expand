@@ -125,34 +125,94 @@ def plan_phases(destinations, source_sql: str):
     return phases
 
 
+JOBS_TABLE = "public.pgdm_expansion_jobs"
+STEPS_TABLE = "public.pgdm_expansion_job_steps"
+JOURNAL_DDL = f"""
+CREATE TABLE IF NOT EXISTS {JOBS_TABLE} (
+    job_id text PRIMARY KEY,
+    scope_key text NOT NULL,
+    tag text NOT NULL,
+    ranges integer NOT NULL,
+    status text NOT NULL,
+    manifest jsonb,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    data_committed_at timestamptz,
+    finished_at timestamptz
+);
+CREATE TABLE IF NOT EXISTS {STEPS_TABLE} (
+    job_id text NOT NULL REFERENCES {JOBS_TABLE}(job_id) ON DELETE CASCADE,
+    step_key text NOT NULL,
+    done_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (job_id, step_key)
+);
+""".strip()
+
+
+def journal_lookup_sql() -> str:
+    """One round trip: ensure the journal exists and return every unfinished job."""
+    return (JOURNAL_DDL + f"""
+SELECT json_build_object('pgdm_unfinished_jobs', COALESCE(json_agg(json_build_object(
+    'job_id', job_id, 'scope_key', scope_key, 'tag', tag, 'ranges', ranges, 'status', status,
+    'manifest', manifest, 'data_committed_at', data_committed_at) ORDER BY created_at), '[]'::json))::text
+FROM {JOBS_TABLE} WHERE status <> 'complete';""")
+
+
+def _guarded(step_key, job_id, body_lines, extra_condition=""):
+    """psql lines that run `body_lines` only if the journal has no `step_key` for the job.
+
+    The body must record the step itself inside its own transaction, so a step is
+    either fully committed and journalled, or neither (exactly-once on resume)."""
+    return [
+        f"SELECT EXISTS (SELECT 1 FROM {STEPS_TABLE} WHERE job_id = {sql_literal(job_id)} "
+        f"AND step_key = {sql_literal(step_key)}{extra_condition}) AS pgdm_step_done \\gset",
+        "\\if :pgdm_step_done",
+        "\\else",
+        *body_lines,
+        "\\endif",
+    ]
+
+
+def _journal(step_key, job_id):
+    return (f"INSERT INTO {STEPS_TABLE} (job_id, step_key) VALUES ({sql_literal(job_id)}, {sql_literal(step_key)}) "
+            "ON CONFLICT DO NOTHING;")
+
+
 def build_pipeline_script(service, *, database_name, source_schema_name, source_table_name,
                           raw_schemas, prepared_destinations, ranges, timing_table_sql,
-                          timing_result_sql, manifest_sql):
-    """Return (bash_script, stage_tables) implementing the whole expansion."""
+                          timing_result_sql, manifest_sql, job_id, tag, scope_key):
+    """Return (bash_script, phases, stage_tables) implementing the whole expansion.
+
+    Every step is journalled in public.pgdm_expansion_job_steps in the same
+    transaction as the data it writes, so re-running the same expansion after an
+    interruption skips completed work and continues where it stopped."""
     source_sql = source_relation_sql(source_schema_name, source_table_name, raw_schemas)
     phases = plan_phases(prepared_destinations, source_sql)
-    tag = secrets.token_hex(4)
     psql = (f"psql -h localhost -U {shlex.quote(service.sql_username)} -d {shlex.quote(database_name)} "
             "-X -qAt -v ON_ERROR_STOP=1")
     lines = [
         "set -u",
         f"PGDM_PSQL={shlex.quote(psql)}",
-        "pgdm_cleanup() { $PGDM_PSQL >/dev/null 2>&1 <<'PGDM_CLEANUP_SQL'",
+        # Every session of this job is tagged, so a resumed run can stop sessions an
+        # interrupted run left behind (e.g. after an SSH drop) before continuing.
+        f"export PGAPPNAME={shlex.quote('pgdm_expand:' + job_id)}",
+        "$PGDM_PSQL >/dev/null <<'PGDM_JOB_SQL' || exit 3",
         "SET client_min_messages = warning;",
-        "DO $pgdm_cleanup$ DECLARE r record; BEGIN",
-        f"  FOR r IN SELECT schemaname, tablename FROM pg_tables WHERE tablename LIKE '{STAGE_PREFIX}{tag}%' LOOP",
-        "    EXECUTE format('DROP TABLE IF EXISTS %I.%I', r.schemaname, r.tablename);",
-        "  END LOOP; END $pgdm_cleanup$;",
-        "PGDM_CLEANUP_SQL",
-        "}",
-        "trap pgdm_cleanup EXIT",
+        "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity "
+        f"WHERE application_name = {sql_literal('pgdm_expand:' + job_id)} AND pid <> pg_backend_pid();",
+        "SELECT pg_sleep(0.2);",
+        JOURNAL_DDL,
+        f"INSERT INTO {JOBS_TABLE} (job_id, scope_key, tag, ranges, status) VALUES ("
+        f"{sql_literal(job_id)}, {sql_literal(scope_key)}, {sql_literal(tag)}, {int(ranges)}, 'running') "
+        "ON CONFLICT (job_id) DO UPDATE SET status = 'running', updated_at = clock_timestamp();",
+        "PGDM_JOB_SQL",
     ]
     stage_tables = []
     alloc = f"public.{STAGE_PREFIX}{tag}_alloc"
     lines += [
         "$PGDM_PSQL >/dev/null <<'PGDM_ALLOC_SQL' || exit 3",
         "SET client_min_messages = warning;",
-        f"CREATE UNLOGGED TABLE {alloc} (destination text, statement_index integer, range_index integer, "
+        f"CREATE TABLE IF NOT EXISTS {alloc} (destination text, statement_index integer, range_index integer, "
         "rows bigint, first_id bigint, id_increment bigint, id_column text, done boolean NOT NULL DEFAULT false, "
         "PRIMARY KEY (destination, statement_index, range_index));",
         "PGDM_ALLOC_SQL",
@@ -181,7 +241,9 @@ def build_pipeline_script(service, *, database_name, source_schema_name, source_
         return body, f'[ "$pgdm_fail" -eq 0 ] || {{ echo "PGDM_{what}_FAILED" >&2; exit {failure_code}; }}'
 
     def inline_transaction(items, phase_number, with_manifest):
-        body = [timing_table_sql, "BEGIN ISOLATION LEVEL REPEATABLE READ;",
+        keys = (["manifest"] if with_manifest else []) + [
+            f"inline:{i['destination']['table_name']}:{i['statement_index']}" for i in items]
+        body = ["BEGIN ISOLATION LEVEL REPEATABLE READ;",
                 "SET LOCAL client_min_messages = warning;"]
         if items:
             seq = next_sequence()
@@ -194,7 +256,10 @@ def build_pipeline_script(service, *, database_name, source_schema_name, source_
             seq = next_sequence()
             body += [f"INSERT INTO pg_temp.pgdm_expansion_timings VALUES ({seq}, 'execute', "
                      "'Scan source and build dependency manifest', clock_timestamp(), NULL, NULL, NULL, NULL);",
-                     manifest_sql,
+                     manifest_sql.rstrip().removesuffix(";") + " AS pgdm_manifest \\gset",
+                     "SELECT :'pgdm_manifest';",
+                     f"UPDATE {JOBS_TABLE} SET manifest = :'pgdm_manifest'::jsonb, updated_at = clock_timestamp() "
+                     f"WHERE job_id = {sql_literal(job_id)};",
                      f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {seq};"]
         for item in items:
             destination = item["destination"]
@@ -208,11 +273,17 @@ def build_pipeline_script(service, *, database_name, source_schema_name, source_
         seq = next_sequence()
         body += [f"INSERT INTO pg_temp.pgdm_expansion_timings VALUES ({seq}, 'execute', "
                  f"{sql_literal(f'Commit phase {phase_number}')}, clock_timestamp(), NULL, NULL, NULL, NULL);",
+                 *[_journal(k, job_id) for k in keys],
                  "COMMIT;",
                  f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {seq};",
                  timing_result_sql]
+        guarded = [timing_table_sql, *_guarded("+".join(keys), job_id, body)]
+        if with_manifest:
+            # On resume the manifest computed by the interrupted run is re-emitted.
+            at = guarded.index("\\else")
+            guarded.insert(at, f"SELECT manifest::text FROM {JOBS_TABLE} WHERE job_id = {sql_literal(job_id)};")
         delimiter = f"PGDM_TXN_{seq}_SQL"
-        lines.extend([f"$PGDM_PSQL <<'{delimiter}' || exit 5", *body, delimiter])
+        lines.extend([f"$PGDM_PSQL <<'{delimiter}' || exit 5", *guarded, delimiter])
 
     def allocation_sql(item):
         dest, columns, _ = item["split"]
@@ -260,6 +331,9 @@ DO $pgdm_insert$
 DECLARE r record; v_rows bigint;
 BEGIN
   SELECT * INTO r FROM {alloc} WHERE destination = {sql_literal(dest)} AND statement_index = {stmt} AND range_index = {k} FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Expansion job journal is missing the id allocation for % range %.', {sql_literal(dest)}, {k};
+  END IF;
   IF r.done THEN RETURN; END IF;
   IF r.id_column IS NULL THEN
     INSERT INTO {dest} ({col_list}) SELECT {values} FROM {stage} ORDER BY pgdm_ord;
@@ -305,10 +379,19 @@ COMMIT;"""
                     select_k = select_sql.replace(
                         source_sql, _range_source_sql(source_schema_name, source_table_name, raw_schemas, k, ranges))
                     stage = item["stage_tables"][k]
-                    sql += [f"DROP TABLE IF EXISTS {stage};",
-                            f"CREATE UNLOGGED TABLE {stage} AS SELECT row_number() OVER (ORDER BY pgdm_q.pgdm_order_key, pgdm_q.pgdm_seq) AS pgdm_ord, {plain} FROM (\n"
-                            f"SELECT pgdm_r.*, row_number() OVER () AS pgdm_seq FROM (\n{select_k}\n) AS pgdm_r\n"
-                            f") AS pgdm_q(pgdm_order_key, {alias}, pgdm_seq);"]
+                    key = f"stage:{item['destination']['table_name']}:{item['statement_index']}:{k}"
+                    sql += _guarded(key, job_id, [
+                        "BEGIN;",
+                        f"DROP TABLE IF EXISTS {stage};",
+                        f"CREATE UNLOGGED TABLE {stage} AS SELECT row_number() OVER (ORDER BY pgdm_q.pgdm_order_key, pgdm_q.pgdm_seq) AS pgdm_ord, {plain} FROM (\n"
+                        f"SELECT pgdm_r.*, row_number() OVER () AS pgdm_seq FROM (\n{select_k}\n) AS pgdm_r\n"
+                        f") AS pgdm_q(pgdm_order_key, {alias}, pgdm_seq);",
+                        _journal(key, job_id),
+                        "COMMIT;"],
+                        # Staging tables are UNLOGGED (no WAL); a server crash truncates
+                        # them, so a staging step only counts if it ran after the last
+                        # postmaster start. Re-staging is deterministic (same rows, ids).
+                        extra_condition=" AND done_at > pg_postmaster_start_time()")
                 scripts.append(sql)
             names = ", ".join(item["destination"]["table_name"] for item in staged)
             body, check = parallel(scripts, 4, "STAGE")
@@ -361,10 +444,14 @@ COMMIT;"""
             if phase_number == 1 and group_index == 0:
                 inline_transaction([], phase_number, with_manifest=True)
             names = ", ".join(item["destination"]["table_name"] for item in items)
+            alloc_sql = ["SET client_min_messages = warning;"]
+            for item in items:
+                key = f"alloc:{item['destination']['table_name']}:{item['statement_index']}"
+                alloc_sql += _guarded(key, job_id, ["BEGIN;", allocation_sql(item), _journal(key, job_id), "COMMIT;"],
+                                      extra_condition=f" AND EXISTS (SELECT 1 FROM {alloc} WHERE destination = "
+                                                      f"{sql_literal(item['split'][0])} AND statement_index = {item['statement_index']})")
             alloc_body = ["$PGDM_PSQL >/dev/null <<'PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL' || exit 6",
-                          "SET client_min_messages = warning;", "BEGIN;",
-                          *[allocation_sql(item) for item in items], "COMMIT;",
-                          "PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL"]
+                          *alloc_sql, "PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL"]
             scripts = [[insert_sql(item, k) for item in items] for k in range(ranges)]
             body, check = parallel(scripts, 7, "INSERT")
             timed_block(f"Insert into {names} in {ranges} parallel sessions (source-ordered id blocks)",
@@ -383,7 +470,23 @@ COMMIT;"""
             lines += ["$PGDM_PSQL <<'PGDM_REPORT_" + str(state["sequence"]) + "_SQL' || exit 8", *report,
                       *[f"DROP TABLE IF EXISTS {t};" for item in items for t in item["stage_tables"]],
                       "PGDM_REPORT_" + str(state["sequence"]) + "_SQL"]
+    lines += ["$PGDM_PSQL >/dev/null <<'PGDM_DATA_DONE_SQL' || exit 9",
+              f"UPDATE {JOBS_TABLE} SET status = 'data_committed', updated_at = clock_timestamp(), "
+              f"data_committed_at = COALESCE(data_committed_at, clock_timestamp()) WHERE job_id = {sql_literal(job_id)};",
+              "PGDM_DATA_DONE_SQL"]
     return "\n".join(lines) + "\n", phases, stage_tables
+
+
+def finish_job_sql(job_id, tag) -> str:
+    """Mark the job complete and drop its allocation/staging tables (after versioning)."""
+    return f"""SET client_min_messages = warning;
+UPDATE {JOBS_TABLE} SET status = 'complete', finished_at = clock_timestamp(), updated_at = clock_timestamp()
+WHERE job_id = {sql_literal(job_id)};
+DO $pgdm_cleanup$ DECLARE r record; BEGIN
+  FOR r IN SELECT schemaname, tablename FROM pg_tables WHERE tablename LIKE {sql_literal(STAGE_PREFIX + tag + '%')} LOOP
+    EXECUTE format('DROP TABLE IF EXISTS %I.%I', r.schemaname, r.tablename);
+  END LOOP;
+END $pgdm_cleanup$;"""
 
 
 def parse_pipeline_output(output: str):
