@@ -62,10 +62,14 @@ class ParallelExpansionTests(unittest.TestCase):
             service, database_name="db", source_schema_name="public", source_table_name="raw_data",
             raw_schemas=["group001"], prepared_destinations=destinations, ranges=3,
             timing_table_sql=service._EXPANSION_TIMING_TABLE_SQL, timing_result_sql=service._EXPANSION_TIMING_RESULT_SQL,
-            manifest_sql="SELECT 1;")
+            manifest_sql="SELECT 1;", job_id="job-1", tag="abcd1234", scope_key="scope")
         self.assertEqual(len(stages), 3)
-        self.assertIn("trap pgdm_cleanup EXIT", script)
-        self.assertEqual(script.count("CREATE UNLOGGED TABLE public.pgdm_xstage_"), 4)  # 3 stages + allocation table
+        self.assertEqual(script.count("CREATE UNLOGGED TABLE public.pgdm_xstage_"), 3)
+        self.assertIn("CREATE TABLE IF NOT EXISTS public.pgdm_xstage_abcd1234_alloc", script)
+        # every staging range and the allocation are journalled and guarded for resume
+        self.assertEqual(script.count("\\if :pgdm_step_done"), 3 + 1)
+        self.assertIn("done_at > pg_postmaster_start_time()", script)
+        self.assertIn("status = 'data_committed'", script)
         self.assertIn("OVERRIDING SYSTEM VALUE", script)
 
 
