@@ -19,6 +19,7 @@ import pandas as pd
 
 from services import psql_session
 from config import (
+    EXPAND_CHUNK_ROWS,
     EXPAND_ENGINE,
     EXPAND_RANGES,
     CONTROL_DB,
@@ -13867,13 +13868,16 @@ SELECT json_build_object(
             journal_output = self.run_remote_command(
                 f"psql -h localhost -U {shlex.quote(self.sql_username)} -d {shlex.quote(database_name)} "
                 "-X -qAt -v ON_ERROR_STOP=1 -f -",
-                stdin_text="SET client_min_messages = warning;\n" + parallel_expansion.journal_lookup_sql(),
+                stdin_text="SET client_min_messages = warning;\n" + parallel_expansion.journal_lookup_sql(
+                    f"{sql_ident(source_schema_name)}.{sql_ident(source_table_name)}"),
                 cancel_event=cancel_event,
             )
-        unfinished = []
+        unfinished, source_rows = [], 0
         for line in journal_output.splitlines():
             if line.strip().startswith("{") and "pgdm_unfinished_jobs" in line:
-                unfinished = json.loads(line).get("pgdm_unfinished_jobs") or []
+                parsed_journal = json.loads(line)
+                unfinished = parsed_journal.get("pgdm_unfinished_jobs") or []
+                source_rows = int(parsed_journal.get("pgdm_source_rows") or 0)
         other = [job for job in unfinished if job.get("scope_key") != scope_key]
         if other:
             raise RuntimeError(
@@ -13885,6 +13889,7 @@ SELECT json_build_object(
         resumed = next((job for job in unfinished if job.get("scope_key") == scope_key), None)
         if resumed:
             job_id, tag, ranges = resumed["job_id"], resumed["tag"], int(resumed["ranges"])
+            workers = min(self._expand_parallel_ranges(), ranges)
             self._notify_progress(progress_callback, "execute", 2,
                                   f"Resuming interrupted expansion job {job_id} ({resumed['status']})...")
         else:
@@ -13895,7 +13900,11 @@ SELECT json_build_object(
                 "preflight",
                 "Detect server parallelism",
             ):
-                ranges = self._expand_parallel_ranges()
+                workers = self._expand_parallel_ranges()
+            # Chunks of about EXPAND_CHUNK_ROWS source rows (at least one per worker,
+            # at most 64 per worker) keep each chunk's source pages in cache.
+            per_worker = max(1, min(64, -(-source_rows // (EXPAND_CHUNK_ROWS * workers))))
+            ranges = workers * per_worker
         with self.expansion_timing_scope(
             timing_report,
             "prepare",
@@ -13919,12 +13928,13 @@ SELECT json_build_object(
                 job_id=job_id,
                 tag=tag,
                 scope_key=scope_key,
+                workers=workers,
             )
         self._notify_progress(
             progress_callback,
             "execute",
             5,
-            f"Running the expansion in {len(phases)} committed phases with {ranges} parallel ranges...",
+            f"Running the expansion in {len(phases)} committed phases: {ranges} chunks on {workers} sessions...",
         )
         with self.expansion_timing_scope(
             timing_report,

@@ -149,10 +149,13 @@ CREATE TABLE IF NOT EXISTS {STEPS_TABLE} (
 """.strip()
 
 
-def journal_lookup_sql() -> str:
-    """One round trip: ensure the journal exists and return every unfinished job."""
+def journal_lookup_sql(source_full_table_name="public.raw_data") -> str:
+    """One round trip: ensure the journal exists, return every unfinished job and the
+    planner's row estimate of the source (used to size the chunks)."""
     return (JOURNAL_DDL + f"""
-SELECT json_build_object('pgdm_unfinished_jobs', COALESCE(json_agg(json_build_object(
+SELECT json_build_object('pgdm_source_rows', (SELECT GREATEST(reltuples, 0)::bigint FROM pg_class
+    WHERE oid = to_regclass({sql_literal(source_full_table_name)})),
+    'pgdm_unfinished_jobs', COALESCE(json_agg(json_build_object(
     'job_id', job_id, 'scope_key', scope_key, 'tag', tag, 'ranges', ranges, 'status', status,
     'manifest', manifest, 'data_committed_at', data_committed_at) ORDER BY created_at), '[]'::json))::text
 FROM {JOBS_TABLE} WHERE status <> 'complete';""")
@@ -180,7 +183,7 @@ def _journal(step_key, job_id):
 
 def build_pipeline_script(service, *, database_name, source_schema_name, source_table_name,
                           raw_schemas, prepared_destinations, ranges, timing_table_sql,
-                          timing_result_sql, manifest_sql, job_id, tag, scope_key):
+                          timing_result_sql, manifest_sql, job_id, tag, scope_key, workers=None):
     """Return (bash_script, phases, stage_tables) implementing the whole expansion.
 
     Every step is journalled in public.pgdm_expansion_job_steps in the same
@@ -188,6 +191,11 @@ def build_pipeline_script(service, *, database_name, source_schema_name, source_
     interruption skips completed work and continues where it stopped."""
     source_sql = source_relation_sql(source_schema_name, source_table_name, raw_schemas)
     phases = plan_phases(prepared_destinations, source_sql)
+    # `ranges` contiguous raw_id chunks are processed by `workers` sessions; worker w takes
+    # chunks w, w + workers, ... so the source pages a chunk needs stay hot while all the
+    # staged recipes of that chunk run back to back.
+    workers = max(1, min(int(workers or ranges), int(ranges)))
+    chunks_of = [list(range(w, ranges, workers)) for w in range(workers)]
     psql = (f"psql -h localhost -U {shlex.quote(service.sql_username)} -d {shlex.quote(database_name)} "
             "-X -qAt -v ON_ERROR_STOP=1")
     lines = [
@@ -393,9 +401,10 @@ COMMIT;"""
                         # postmaster start. Re-staging is deterministic (same rows, ids).
                         extra_condition=" AND done_at > pg_postmaster_start_time()")
                 scripts.append(sql)
+            scripts = [[line for k in chunks_of[w] for line in scripts[k]] for w in range(workers)]
             names = ", ".join(item["destination"]["table_name"] for item in staged)
             body, check = parallel(scripts, 4, "STAGE")
-            timed_block(f"Transform source in {ranges} parallel raw_id ranges for {names}", body)
+            timed_block(f"Transform source in {ranges} raw_id chunks on {workers} parallel sessions for {names}", body)
             lines.append(check)
 
         # --- 2. walk the phase in recipe order: inline runs go through one transaction,
@@ -452,9 +461,9 @@ COMMIT;"""
                                                       f"{sql_literal(item['split'][0])} AND statement_index = {item['statement_index']})")
             alloc_body = ["$PGDM_PSQL >/dev/null <<'PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL' || exit 6",
                           *alloc_sql, "PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL"]
-            scripts = [[insert_sql(item, k) for item in items] for k in range(ranges)]
+            scripts = [[insert_sql(item, k) for k in chunks_of[w] for item in items] for w in range(workers)]
             body, check = parallel(scripts, 7, "INSERT")
-            timed_block(f"Insert into {names} in {ranges} parallel sessions (source-ordered id blocks)",
+            timed_block(f"Insert into {names} in {workers} parallel sessions (source-ordered id blocks)",
                         alloc_body + body)
             lines.append(check)
             report = []

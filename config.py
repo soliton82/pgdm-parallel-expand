@@ -27,3 +27,5 @@ APP_GEOMETRY = "1560x860"
 # "auto" = number of server CPU cores (capped at 16).
 EXPAND_ENGINE = _environment_value("PDM_EXPAND_ENGINE", "parallel").lower()
 EXPAND_RANGES = _environment_value("PDM_EXPAND_RANGES", "auto").lower()
+# Target source rows per chunk; workers process chunks round-robin (PDM_EXPAND_CHUNK_ROWS).
+EXPAND_CHUNK_ROWS = max(10000, int(_environment_value("PDM_EXPAND_CHUNK_ROWS", "250000")))

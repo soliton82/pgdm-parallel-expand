@@ -167,6 +167,11 @@ overridden with `PDM_EXPAND_RANGES`.
 4. To compare, run once with `PDM_EXPAND_ENGINE=legacy` on a freshly generated
    database. To test recovery, interrupt the run (close the app or cut the network),
    then run the same Expand again: it resumes.
+5. Scripted alternative to the GUI: [`tools/challenge/`](tools/challenge/README.md).
+   - `run_expand.py` runs the headless Expand and prints the same report.
+   - `verify_outputs.py` writes or compares the exact-output digest.
+   - `crash_resume_test.py` kills an Expand after N seconds, resumes it, and verifies
+     the result.
 
 Configuration (environment variables): `PDM_EXPAND_ENGINE` = `parallel` (default) or
 `legacy`; `PDM_EXPAND_RANGES` = `auto` (default, server `nproc`) or a number.
