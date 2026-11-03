@@ -18,6 +18,8 @@ import paramiko
 import pandas as pd
 
 from config import (
+    EXPAND_ENGINE,
+    EXPAND_RANGES,
     CONTROL_DB,
     CONTROL_SCHEMA,
     DATA_DICTIONARY_TABLE,
@@ -73,6 +75,39 @@ class PostgresAdminService:
     CROSS_TABLE_EXPANSION_OPERATION_KIND = "cross_table_expand_v1"
     CROSS_TABLE_EXPANSION_DEPENDENCY_KIND = "raw_schema_expand_v1"
     CROSS_TABLE_SOURCE_PLACEHOLDER = "{{source}}"
+    _EXPANSION_TIMING_TABLE_SQL = """
+CREATE TEMP TABLE pgdm_expansion_timings (
+    sequence_number integer PRIMARY KEY,
+    stage_key text NOT NULL,
+    item_name text NOT NULL,
+    started_at timestamptz NOT NULL,
+    finished_at timestamptz,
+    rows_affected bigint,
+    destination_name text,
+    statement_index integer
+) ON COMMIT PRESERVE ROWS;
+""".strip()
+    _EXPANSION_TIMING_RESULT_SQL = """
+SELECT json_build_object(
+    'pgdm_expansion_timings', COALESCE(
+        json_agg(
+            json_build_object(
+                'sequence', sequence_number,
+                'stage', stage_key,
+                'name', item_name,
+                'duration_seconds', EXTRACT(
+                    EPOCH FROM (finished_at - started_at)
+                ),
+                'rows', rows_affected,
+                'destination', destination_name,
+                'statement_index', statement_index
+            ) ORDER BY sequence_number
+        ),
+        '[]'::json
+    )
+)::text
+FROM pg_temp.pgdm_expansion_timings;
+""".strip()
     RAW_REVIEW_PREVIEW_LIMIT = 500
     EXCEL_EXTENSIONS = {".xls", ".xlsx", ".xlsm"}
     HIDDEN_DATABASES = {"postgres", "metabase"}
@@ -13785,6 +13820,136 @@ SELECT json_build_object(
 )::text;
 """.strip()
 
+    def _expand_parallel_ranges(self) -> int:
+        cached = getattr(self, "_pgdm_expand_ranges", None)
+        if cached:
+            return cached
+        if EXPAND_RANGES.isdigit():
+            ranges = int(EXPAND_RANGES)
+        else:
+            output = self.run_remote_command("nproc 2>/dev/null || getconf _NPROCESSORS_ONLN")
+            digits = re.findall(r"\d+", output or "")
+            ranges = int(digits[0]) if digits else 4
+        ranges = max(1, min(int(ranges), 16))
+        self._pgdm_expand_ranges = ranges
+        return ranges
+
+    def _execute_cross_table_expansion_parallel(
+        self,
+        database_name,
+        prepared,
+        source_versions,
+        timing_report,
+        cancel_event=None,
+        progress_callback=None,
+        post_commit_callback=None,
+    ) -> dict:
+        from services import parallel_expansion
+
+        source_schema_name = prepared["source_schema_name"]
+        source_table_name = prepared["source_table_name"]
+        with self.expansion_timing_scope(
+            timing_report,
+            "preflight",
+            "Detect server parallelism",
+        ):
+            ranges = self._expand_parallel_ranges()
+        with self.expansion_timing_scope(
+            timing_report,
+            "prepare",
+            "Build parallel phase-committed expansion pipeline",
+        ):
+            script, phases, _ = parallel_expansion.build_pipeline_script(
+                self,
+                database_name=database_name,
+                source_schema_name=source_schema_name,
+                source_table_name=source_table_name,
+                raw_schemas=prepared["raw_schemas"],
+                prepared_destinations=prepared["destinations"],
+                ranges=ranges,
+                timing_table_sql=self._EXPANSION_TIMING_TABLE_SQL,
+                timing_result_sql=self._EXPANSION_TIMING_RESULT_SQL,
+                manifest_sql=self._build_expansion_manifest_sql(
+                    source_schema_name,
+                    source_table_name,
+                    prepared["raw_schemas"],
+                ),
+            )
+        self._notify_progress(
+            progress_callback,
+            "execute",
+            5,
+            f"Running the expansion in {len(phases)} committed phases with {ranges} parallel ranges...",
+        )
+        with self.expansion_timing_scope(
+            timing_report,
+            "execute",
+            "Expansion database batch envelope",
+            record_local_cpu=False,
+            remote_include_in_total=False,
+        ):
+            output = self.run_remote_command(
+                "bash -s",
+                stdin_text=script,
+                cancel_event=cancel_event,
+            )
+        if post_commit_callback:
+            post_commit_callback()
+        with self.expansion_timing_scope(
+            timing_report,
+            "execute",
+            "Parse database manifest and timing telemetry",
+        ):
+            manifest, server_timing_items = parallel_expansion.parse_pipeline_output(output)
+            for item in server_timing_items:
+                self._append_expansion_timing(
+                    timing_report,
+                    item.get("stage") or "execute",
+                    item.get("name") or "PostgreSQL expansion step",
+                    float(item.get("duration_seconds") or 0.0),
+                    "postgresql_backend_wall",
+                    rows=item.get("rows"),
+                    destination=item.get("destination"),
+                    details=(
+                        "Measured on the PostgreSQL server (clock_timestamp() in the "
+                        "session, or date +%s%N around the parallel staging sessions); "
+                        "SSH transport is excluded."
+                    ),
+                )
+        if manifest is None:
+            raise RuntimeError(
+                "The expansion completed, but the source manifest was not returned."
+            )
+        self._notify_progress(progress_callback, "execute", 100, "Data committed to the destinations.")
+        timing_report["source_rows"] = int(manifest.get("expected_row_count") or 0)
+        destination_row_totals = {}
+        for item in timing_report.get("items") or []:
+            destination_name = item.get("destination")
+            rows_affected = item.get("rows")
+            if not destination_name or rows_affected is None:
+                continue
+            destination_row_totals[destination_name] = (
+                destination_row_totals.get(destination_name, 0) + int(rows_affected)
+            )
+        timing_report["destination_rows"] = [
+            {"table_name": destination["table_name"],
+             "rows": int(destination_row_totals.get(destination["table_name"], 0))}
+            for destination in prepared["destinations"]
+        ]
+        timing_report["total_rows_inserted"] = sum(
+            item["rows"] for item in timing_report["destination_rows"]
+        )
+        return {
+            "source_database_name": database_name,
+            "source_schema_name": source_schema_name,
+            "source_table_name": source_table_name,
+            "raw_schemas": list(prepared["raw_schemas"]),
+            "source_versions": source_versions,
+            "dependency_manifest": manifest,
+            "destinations": prepared["destinations"],
+            "timing_report": timing_report,
+        }
+
     def execute_cross_table_expansion(
         self,
         database_name: str,
@@ -13958,6 +14123,17 @@ SELECT json_build_object(
             ),
         )
         self._raise_if_cancelled(cancel_event)
+
+        if EXPAND_ENGINE == "parallel":
+            return self._execute_cross_table_expansion_parallel(
+                database_name,
+                prepared,
+                source_versions,
+                timing_report,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                post_commit_callback=post_commit_callback,
+            )
 
         with self.expansion_timing_scope(
             timing_report,

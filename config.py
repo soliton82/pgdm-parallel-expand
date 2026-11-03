@@ -21,3 +21,9 @@ LOCAL_STORAGE_DIR = _environment_value("PDM_LOCAL_STORAGE_DIR", APP_NAME)
 
 APP_TITLE = _environment_value("PDM_APP_TITLE", APP_NAME)
 APP_GEOMETRY = "1560x860"
+
+# Expand engine: "parallel" (phase-committed, range-parallel staging; default) or "legacy"
+# (the original single-transaction script). PDM_EXPAND_RANGES: number of server sessions,
+# "auto" = number of server CPU cores (capped at 16).
+EXPAND_ENGINE = _environment_value("PDM_EXPAND_ENGINE", "parallel").lower()
+EXPAND_RANGES = _environment_value("PDM_EXPAND_RANGES", "auto").lower()
