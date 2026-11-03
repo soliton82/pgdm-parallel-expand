@@ -17,6 +17,7 @@ from pathlib import Path
 import paramiko
 import pandas as pd
 
+from services import psql_session
 from config import (
     EXPAND_ENGINE,
     EXPAND_RANGES,
@@ -599,6 +600,11 @@ FROM pg_temp.pgdm_expansion_timings;
         if self.sql_password is None:
             raise RuntimeError("Senha do PostgreSQL n?o dispon?vel.")
 
+        sessions = getattr(self._expansion_timing_local, "psql_sessions", None)
+        if sessions is not None:
+            parsed = psql_session.parse_psql_command(command, stdin_text)
+            if parsed:
+                return self._run_read_only_psql_in_session(sessions, *parsed)
         command_name = trace_label or "remote command"
         command_started_at = time.perf_counter()
         self._trace_table_open(trace_context, f"{command_name}: iniciou comando remoto")
@@ -14002,7 +14008,47 @@ SELECT json_build_object(
             stdin_text=parallel_expansion.finish_job_sql(job["job_id"], job["tag"]),
         )
 
-    def execute_cross_table_expansion(
+    def _run_read_only_psql_in_session(self, sessions, database_name, sql, output_format, tuples_only):
+        session = sessions.get(database_name)
+        if session is None:
+            session = psql_session.PersistentPsql(
+                self.ssh_client, self.sql_username, self.sql_password,
+                self.postgres_port or 5432, database_name)
+            sessions[database_name] = session
+        try:
+            output, seconds = session.query(sql, output_format, tuples_only)
+        except Exception:
+            sessions.pop(database_name, None)
+            session.close()
+            raise
+        timing_context = getattr(self._expansion_timing_local, "context", None)
+        if timing_context:
+            timing_context["remote_count"] += 1
+            remote_name = timing_context["name"]
+            if timing_context["remote_count"] > 1:
+                remote_name += f" - server command {timing_context['remote_count']}"
+            self._append_expansion_timing(
+                timing_context["report"], timing_context["stage"], remote_name, seconds,
+                "remote_server_wall",
+                details="Measured by psql \\timing on the Linux server in a persistent session.",
+                include_in_total=timing_context["remote_include_in_total"],
+            )
+        return output
+
+    def execute_cross_table_expansion(self, *args, **kwargs) -> dict:
+        if EXPAND_ENGINE != "parallel" or not self.ssh_client:
+            return self._execute_cross_table_expansion_impl(*args, **kwargs)
+        # Read-only catalog checks of this expansion share one psql per database.
+        sessions = {}
+        self._expansion_timing_local.psql_sessions = sessions
+        try:
+            return self._execute_cross_table_expansion_impl(*args, **kwargs)
+        finally:
+            self._expansion_timing_local.psql_sessions = None
+            for session in sessions.values():
+                session.close()
+
+    def _execute_cross_table_expansion_impl(
         self,
         database_name: str,
         source_full_table_name: str,
