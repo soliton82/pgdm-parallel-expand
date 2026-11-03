@@ -66,8 +66,8 @@ class ParallelExpansionTests(unittest.TestCase):
         self.assertEqual(len(stages), 3)
         self.assertEqual(script.count("CREATE UNLOGGED TABLE public.pgdm_xstage_"), 3)
         self.assertIn("CREATE TABLE IF NOT EXISTS public.pgdm_xstage_abcd1234_alloc", script)
-        # every staging range and the allocation are journalled and guarded for resume
-        self.assertEqual(script.count("\\if :pgdm_step_done"), 3 + 1)
+        # every staging range, the allocation and the manifest are journalled and guarded
+        self.assertEqual(script.count("\\if :pgdm_step_done"), 3 + 1 + 1)  # stages, allocation, manifest
         self.assertIn("done_at > pg_postmaster_start_time()", script)
         self.assertIn("status = 'data_committed'", script)
         self.assertIn("OVERRIDING SYSTEM VALUE", script)
