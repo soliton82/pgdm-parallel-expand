@@ -13915,6 +13915,7 @@ SELECT json_build_object(
                         "session, or date +%s%N around the parallel staging sessions); "
                         "SSH transport is excluded."
                     ),
+                    include_in_total=item.get("include_in_total", True) is not False,
                 )
         if manifest is None:
             raise RuntimeError(

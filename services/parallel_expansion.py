@@ -148,10 +148,141 @@ def build_pipeline_script(service, *, database_name, source_schema_name, source_
         "trap pgdm_cleanup EXIT",
     ]
     stage_tables = []
-    sequence = 10
+    alloc = f"public.{STAGE_PREFIX}{tag}_alloc"
+    lines += [
+        "$PGDM_PSQL >/dev/null <<'PGDM_ALLOC_SQL' || exit 3",
+        "SET client_min_messages = warning;",
+        f"CREATE UNLOGGED TABLE {alloc} (destination text, statement_index integer, range_index integer, "
+        "rows bigint, first_id bigint, id_increment bigint, id_column text, done boolean NOT NULL DEFAULT false, "
+        "PRIMARY KEY (destination, statement_index, range_index));",
+        "PGDM_ALLOC_SQL",
+    ]
+    state = {"sequence": 10}
+
+    def next_sequence():
+        state["sequence"] += 1
+        return state["sequence"]
+
+    def timed_block(label, body_lines):
+        """Wrap shell lines with a server-side wall-clock measurement (included telemetry)."""
+        seq = next_sequence()
+        lines.append("pgdm_ts=$(date +%s%N)")
+        lines.extend(body_lines)
+        lines.append("pgdm_te=$(date +%s%N)")
+        lines.append("printf 'PGDM_STAGE_TIMING %s %s\\n' \"$((pgdm_te - pgdm_ts))\" "
+                     + shlex.quote(json.dumps({"sequence": seq, "name": label})))
+
+    def parallel(scripts, failure_code, what):
+        body = ["pgdm_pids=''"]
+        for k, sql in enumerate(scripts):
+            delimiter = f"PGDM_{what}_{state['sequence']}_{k}_SQL"
+            body += [f"$PGDM_PSQL >/dev/null <<'{delimiter}' &", *sql, delimiter, 'pgdm_pids="$pgdm_pids $!"']
+        body += ["pgdm_fail=0; for p in $pgdm_pids; do wait $p || pgdm_fail=1; done"]
+        return body, f'[ "$pgdm_fail" -eq 0 ] || {{ echo "PGDM_{what}_FAILED" >&2; exit {failure_code}; }}'
+
+    def inline_transaction(items, phase_number, with_manifest):
+        body = [timing_table_sql, "BEGIN ISOLATION LEVEL REPEATABLE READ;",
+                "SET LOCAL client_min_messages = warning;"]
+        if items:
+            seq = next_sequence()
+            body += [f"INSERT INTO pg_temp.pgdm_expansion_timings VALUES ({seq}, 'execute', "
+                     f"{sql_literal(f'Acquire destination table locks (phase {phase_number})')}, clock_timestamp(), NULL, NULL, NULL, NULL);",
+                     service._build_cross_table_expansion_lock_sql(
+                         list({id(i["destination"]): i["destination"] for i in items}.values())),
+                     f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {seq};"]
+        if with_manifest:
+            seq = next_sequence()
+            body += [f"INSERT INTO pg_temp.pgdm_expansion_timings VALUES ({seq}, 'execute', "
+                     "'Scan source and build dependency manifest', clock_timestamp(), NULL, NULL, NULL, NULL);",
+                     manifest_sql,
+                     f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {seq};"]
+        for item in items:
+            destination = item["destination"]
+            body.append(service._build_managed_dml_sql(
+                item["statement"], destination["schema_name"], destination["pure_table_name"], "add",
+                timing_sequence=next_sequence(), timing_stage="execute",
+                timing_name=f"Insert into {destination['table_name']} (statement {item['statement_index']})",
+                timing_destination=destination["table_name"],
+                timing_statement_index=item["statement_index"],
+            ))
+        seq = next_sequence()
+        body += [f"INSERT INTO pg_temp.pgdm_expansion_timings VALUES ({seq}, 'execute', "
+                 f"{sql_literal(f'Commit phase {phase_number}')}, clock_timestamp(), NULL, NULL, NULL, NULL);",
+                 "COMMIT;",
+                 f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {seq};",
+                 timing_result_sql]
+        delimiter = f"PGDM_TXN_{seq}_SQL"
+        lines.extend([f"$PGDM_PSQL <<'{delimiter}' || exit 5", *body, delimiter])
+
+    def allocation_sql(item):
+        dest, columns, _ = item["split"]
+        excluded = ", ".join(sql_literal(c.strip('"').lower()) for c in columns)
+        stmt = item["statement_index"]
+        counts = "\n".join(
+            f"  EXECUTE 'SELECT count(*) FROM {t}' INTO v_n;\n"
+            f"  INSERT INTO {alloc} VALUES ({sql_literal(dest)}, {stmt}, {k}, v_n, "
+            f"CASE WHEN v_seq IS NULL THEN NULL ELSE v_start + v_total * v_inc END, v_inc, v_col);\n"
+            f"  v_total := v_total + v_n;"
+            for k, t in enumerate(item["stage_tables"]))
+        return f"""DO $pgdm_alloc$
+DECLARE v_col text; v_seq text; v_last bigint; v_called boolean; v_inc bigint := 1; v_start bigint; v_total bigint := 0; v_n bigint;
+BEGIN
+  -- Reserve one contiguous block of the destination's identity/serial values, in source order.
+  SELECT a.attname, pg_get_serial_sequence({sql_literal(dest)}, a.attname) INTO v_col, v_seq
+  FROM pg_attribute a
+  WHERE a.attrelid = {sql_literal(dest)}::regclass AND a.attnum > 0 AND NOT a.attisdropped
+    AND pg_get_serial_sequence({sql_literal(dest)}, a.attname) IS NOT NULL
+    AND lower(a.attname) <> ALL (ARRAY[{excluded}]::text[])
+  ORDER BY a.attnum LIMIT 1;
+  IF v_seq IS NOT NULL THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended('pgdm_expand_alloc:' || v_seq, 0));
+    EXECUTE format('SELECT last_value, is_called FROM %s', v_seq) INTO v_last, v_called;
+    SELECT seqincrement INTO v_inc FROM pg_sequence WHERE seqrelid = v_seq::regclass;
+    v_start := CASE WHEN v_called THEN v_last + v_inc ELSE v_last END;
+  END IF;
+{counts}
+  IF v_seq IS NOT NULL AND v_total > 0 THEN
+    PERFORM setval(v_seq, v_start + (v_total - 1) * v_inc, true);
+  END IF;
+END $pgdm_alloc$;"""
+
+    def insert_sql(item, k):
+        destination = item["destination"]
+        dest, columns, _ = item["split"]
+        stage = item["stage_tables"][k]
+        values = ", ".join(f"pgdm_c{i}" for i in range(len(columns)))
+        col_list = ", ".join(columns)
+        stmt = item["statement_index"]
+        return f"""BEGIN;
+SET LOCAL client_min_messages = warning;
+SET LOCAL max_parallel_workers_per_gather = 0;
+DO $pgdm_insert$
+DECLARE r record; v_rows bigint;
+BEGIN
+  SELECT * INTO r FROM {alloc} WHERE destination = {sql_literal(dest)} AND statement_index = {stmt} AND range_index = {k} FOR UPDATE;
+  IF r.done THEN RETURN; END IF;
+  IF r.id_column IS NULL THEN
+    INSERT INTO {dest} ({col_list}) SELECT {values} FROM {stage} ORDER BY pgdm_ord;
+  ELSE
+    EXECUTE format('INSERT INTO {dest} (%I, {col_list.replace('%', '%%')}) OVERRIDING SYSTEM VALUE '
+                   'SELECT $1 + (pgdm_ord - 1) * $2, {values} FROM {stage}', r.id_column)
+      USING r.first_id, r.id_increment;
+  END IF;
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  UPDATE {alloc} SET done = true WHERE destination = {sql_literal(dest)} AND statement_index = {stmt} AND range_index = {k};
+  UPDATE {service_counter_table} SET row_count = row_count + v_rows, updated_at = clock_timestamp()
+  WHERE schema_name = {sql_literal(destination['schema_name'])} AND table_name = {sql_literal(destination['pure_table_name'])};
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Contador ausente para %.% durante insercao.', {sql_literal(destination['schema_name'])}, {sql_literal(destination['pure_table_name'])};
+  END IF;
+END $pgdm_insert$;
+COMMIT;"""
+
+    from services.postgres_service import DATA_TABLE_ROW_COUNTS as service_counter_table
+
     for phase_number, phase in enumerate(phases, start=1):
         staged = [item for item in phase if item["split"]]
-        # --- parallel staging: one session per raw_id range, all staged recipes of the phase
+        # --- 1. parallel staging: one session per raw_id range, every staged recipe of the phase
         if staged:
             for item in staged:
                 item["stage_tables"] = [
@@ -159,100 +290,110 @@ def build_pipeline_script(service, *, database_name, source_schema_name, source_
                     for k in range(ranges)
                 ]
                 stage_tables.extend(item["stage_tables"])
-            lines.append("pgdm_ts=$(date +%s%N); pgdm_pids=''")
+            scripts = []
             for k in range(ranges):
-                # Nested loops keep every source row's output rows consecutive and in
-                # recipe order; row_number() records that order before the sort by key.
-                sql = [
-                    "SET client_min_messages = warning;",
-                    "SET max_parallel_workers_per_gather = 0;",
-                    "SET enable_hashjoin = off;",
-                    "SET enable_mergejoin = off;",
-                    "SET work_mem = '64MB';",
-                ]
+                # Nested loops keep each source row's output rows consecutive and in recipe
+                # order; pgdm_seq records that order, pgdm_ord is the final source order.
+                sql = ["SET client_min_messages = warning;",
+                       "SET max_parallel_workers_per_gather = 0;",
+                       "SET enable_hashjoin = off;", "SET enable_mergejoin = off;",
+                       "SET work_mem = '64MB';"]
                 for item in staged:
                     _, columns, select_sql = item["split"]
                     alias = ", ".join(f"pgdm_c{i}" for i in range(len(columns)))
                     plain = ", ".join(f"pgdm_q.pgdm_c{i}" for i in range(len(columns)))
                     select_k = select_sql.replace(
-                        source_sql,
-                        _range_source_sql(source_schema_name, source_table_name, raw_schemas, k, ranges),
-                    )
+                        source_sql, _range_source_sql(source_schema_name, source_table_name, raw_schemas, k, ranges))
                     stage = item["stage_tables"][k]
-                    sql.append(f"DROP TABLE IF EXISTS {stage};")
-                    sql.append(
-                        f"CREATE UNLOGGED TABLE {stage} AS SELECT {plain} FROM (\n"
-                        f"SELECT pgdm_r.*, row_number() OVER () AS pgdm_seq FROM (\n{select_k}\n) AS pgdm_r\n"
-                        f") AS pgdm_q(pgdm_order_key, {alias}, pgdm_seq) ORDER BY pgdm_q.pgdm_order_key, pgdm_q.pgdm_seq;")
-                delimiter = f"PGDM_STAGE_{phase_number}_{k}_SQL"
-                lines.append(f"$PGDM_PSQL >/dev/null <<'{delimiter}' &")
-                lines.extend(sql)
-                lines.append(delimiter)
-                lines.append('pgdm_pids="$pgdm_pids $!"')
-            lines.append("pgdm_fail=0; for p in $pgdm_pids; do wait $p || pgdm_fail=1; done")
-            lines.append("pgdm_te=$(date +%s%N)")
+                    sql += [f"DROP TABLE IF EXISTS {stage};",
+                            f"CREATE UNLOGGED TABLE {stage} AS SELECT row_number() OVER (ORDER BY pgdm_q.pgdm_order_key, pgdm_q.pgdm_seq) AS pgdm_ord, {plain} FROM (\n"
+                            f"SELECT pgdm_r.*, row_number() OVER () AS pgdm_seq FROM (\n{select_k}\n) AS pgdm_r\n"
+                            f") AS pgdm_q(pgdm_order_key, {alias}, pgdm_seq);"]
+                scripts.append(sql)
             names = ", ".join(item["destination"]["table_name"] for item in staged)
-            label = f"Transform source in {ranges} parallel raw_id ranges for {names}"
-            lines.append(
-                "printf 'PGDM_STAGE_TIMING %s %s\\n' \"$((pgdm_te - pgdm_ts))\" "
-                + shlex.quote(json.dumps({"sequence": sequence, "name": label}))
-            )
-            sequence += 1
-            lines.append('[ "$pgdm_fail" -eq 0 ] || { echo "PGDM_STAGE_FAILED phase ' + str(phase_number) + '" >&2; exit 4; }')
+            body, check = parallel(scripts, 4, "STAGE")
+            timed_block(f"Transform source in {ranges} parallel raw_id ranges for {names}", body)
+            lines.append(check)
 
-        # --- one transaction per phase: inline recipes + ordered inserts from the stages
-        body = [timing_table_sql, "BEGIN ISOLATION LEVEL REPEATABLE READ;",
-                "SET LOCAL client_min_messages = warning;",
-                "SET LOCAL max_parallel_workers_per_gather = 0;"]
-        lock_sql = service._build_cross_table_expansion_lock_sql(
-            list({id(item["destination"]): item["destination"] for item in phase}.values()))
-        body += [f"INSERT INTO pg_temp.pgdm_expansion_timings VALUES ({sequence}, 'execute', "
-                 f"{sql_literal(f'Acquire destination table locks (phase {phase_number})')}, clock_timestamp(), NULL, NULL, NULL, NULL);",
-                 lock_sql,
-                 f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {sequence};"]
-        sequence += 1
-        if phase_number == 1:
-            body += [f"INSERT INTO pg_temp.pgdm_expansion_timings VALUES ({sequence}, 'execute', "
-                     "'Scan source and build dependency manifest', clock_timestamp(), NULL, NULL, NULL, NULL);",
-                     manifest_sql,
-                     f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {sequence};"]
-            sequence += 1
+        # --- 2. walk the phase in recipe order: inline runs go through one transaction,
+        #        staged runs are inserted by `ranges` parallel sessions with pre-allocated ids.
+        groups = []
         for item in phase:
-            destination = item["destination"]
-            if item["split"]:
-                dest, columns, _ = item["split"]
-                union = "\nUNION ALL\n".join(f"SELECT * FROM {t}" for t in item["stage_tables"])
-                statement = f"INSERT INTO {dest} (\n    {', '.join(columns)}\n)\n{union}"
-            else:
-                statement = item["statement"]
-            body.append(service._build_managed_dml_sql(
-                statement, destination["schema_name"], destination["pure_table_name"], "add",
-                timing_sequence=sequence, timing_stage="execute",
-                timing_name=f"Insert into {destination['table_name']} (statement {item['statement_index']})",
-                timing_destination=destination["table_name"],
-                timing_statement_index=item["statement_index"],
-            ))
-            sequence += 1
-            for table in item.get("stage_tables") or []:
-                body.append(f"DROP TABLE {table};")
-        body += [f"INSERT INTO pg_temp.pgdm_expansion_timings VALUES ({sequence}, 'execute', "
-                 f"{sql_literal(f'Commit phase {phase_number}')}, clock_timestamp(), NULL, NULL, NULL, NULL);",
-                 "COMMIT;",
-                 f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {sequence};",
-                 timing_result_sql]
-        sequence += 1
-        delimiter = f"PGDM_PHASE_{phase_number}_SQL"
-        lines.append(f"$PGDM_PSQL <<'{delimiter}' || exit 5")
-        lines.extend(body)
-        lines.append(delimiter)
+            kind = "staged" if item["split"] else "inline"
+            if not groups or groups[-1][0] != kind:
+                groups.append((kind, []))
+            groups[-1][1].append(item)
+        for group_index, (kind, items) in enumerate(groups):
+            if kind == "inline":
+                first = phase_number == 1 and group_index == 0
+                written_here = {_relation_key(i["destination"]["table_name"]) for i in items}
+                independent = len(items) > 1 and all(
+                    not ({_relation_key(f"{a}.{b}") for a, b in i["destination"].get("read_relations") or []} & written_here)
+                    for i in items)
+                if not independent:
+                    inline_transaction(items, phase_number, with_manifest=first)
+                    continue
+                # Recipes that do not read each other's output run as concurrent
+                # transactions (same statements and plans as the legacy engine).
+                saved, lines[:] = list(lines), []
+                inline_transaction([], phase_number, with_manifest=True) if first else None
+                for item in items:
+                    inline_transaction([item], phase_number, with_manifest=False)
+                txns, lines[:] = list(lines), saved
+                body, i = ["pgdm_pids=''", "pgdm_out=$(mktemp -d)"], 0
+                for line in txns:
+                    if line.startswith("$PGDM_PSQL <<'PGDM_TXN_") and line.endswith("|| exit 5"):
+                        body.append(line.replace(" || exit 5", f" > $pgdm_out/{i}.out &"))
+                        i += 1
+                    elif line.startswith("PGDM_TXN_") and line.endswith("_SQL"):
+                        body += [line, 'pgdm_pids="$pgdm_pids $!"']
+                    else:
+                        body.append(line)
+                body += ["pgdm_fail=0; for p in $pgdm_pids; do wait $p || pgdm_fail=1; done"]
+                # The block's wall time is the included measurement; the per-session
+                # items inside it overlap in time and are reported as diagnostics only.
+                timed_block("Run " + ", ".join(["source manifest"] if first else [])
+                            + ("" if not first else ", ") + ", ".join(i["destination"]["table_name"] for i in items)
+                            + f" as {len(items) + int(first)} concurrent transactions", body)
+                lines += ["echo PGDM_CONCURRENT_BEGIN", "cat $pgdm_out/*.out; rm -rf $pgdm_out", "echo PGDM_CONCURRENT_END"]
+                lines.append('[ "$pgdm_fail" -eq 0 ] || { echo "PGDM_INLINE_FAILED" >&2; exit 5; }')
+                continue
+            if phase_number == 1 and group_index == 0:
+                inline_transaction([], phase_number, with_manifest=True)
+            names = ", ".join(item["destination"]["table_name"] for item in items)
+            alloc_body = ["$PGDM_PSQL >/dev/null <<'PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL' || exit 6",
+                          "SET client_min_messages = warning;", "BEGIN;",
+                          *[allocation_sql(item) for item in items], "COMMIT;",
+                          "PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL"]
+            scripts = [[insert_sql(item, k) for item in items] for k in range(ranges)]
+            body, check = parallel(scripts, 7, "INSERT")
+            timed_block(f"Insert into {names} in {ranges} parallel sessions (source-ordered id blocks)",
+                        alloc_body + body)
+            lines.append(check)
+            report = []
+            for item in items:
+                dest = item["split"][0]
+                report.append(
+                    f"SELECT json_build_object('pgdm_expansion_timings', json_build_array(json_build_object("
+                    f"'sequence', {next_sequence()}, 'stage', 'execute', "
+                    f"'name', {sql_literal('Insert into ' + item['destination']['table_name'] + ' (statement ' + str(item['statement_index']) + ') - rows; time in parallel item above')}, "
+                    f"'duration_seconds', 0, 'rows', (SELECT sum(rows) FROM {alloc} WHERE destination = {sql_literal(dest)} "
+                    f"AND statement_index = {item['statement_index']} AND done), "
+                    f"'destination', {sql_literal(item['destination']['table_name'])}, 'statement_index', {item['statement_index']})))::text;")
+            lines += ["$PGDM_PSQL <<'PGDM_REPORT_" + str(state["sequence"]) + "_SQL' || exit 8", *report,
+                      *[f"DROP TABLE IF EXISTS {t};" for item in items for t in item["stage_tables"]],
+                      "PGDM_REPORT_" + str(state["sequence"]) + "_SQL"]
     return "\n".join(lines) + "\n", phases, stage_tables
 
 
 def parse_pipeline_output(output: str):
     """Collect the manifest, all phase timing items and the staging timings."""
-    manifest, items = None, []
+    manifest, items, concurrent = None, [], False
     for line in output.splitlines():
         candidate = line.strip()
+        if candidate in ("PGDM_CONCURRENT_BEGIN", "PGDM_CONCURRENT_END"):
+            concurrent = candidate.endswith("BEGIN")
+            continue
         if candidate.startswith("PGDM_STAGE_TIMING "):
             _, ns, payload = candidate.split(" ", 2)
             meta = json.loads(payload)
@@ -268,6 +409,10 @@ def parse_pipeline_output(output: str):
         if isinstance(parsed, dict) and "raw_hash_manifest" in parsed:
             manifest = parsed
         if isinstance(parsed, dict) and "pgdm_expansion_timings" in parsed:
-            items.extend(parsed.get("pgdm_expansion_timings") or [])
+            for item in parsed.get("pgdm_expansion_timings") or []:
+                if concurrent:
+                    item["include_in_total"] = False
+                    item["name"] = f"{item.get('name')} (concurrent session; covered by the block above)"
+                items.append(item)
     items.sort(key=lambda item: item.get("sequence") or 0)
     return manifest, items
