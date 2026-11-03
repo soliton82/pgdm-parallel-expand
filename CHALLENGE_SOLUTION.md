@@ -14,6 +14,7 @@ version/dependency records.
 |---|---:|---:|---:|
 | 100,000 `raw_data` rows | 8.76 s | **2.81 s** | 3.1× |
 | 1,000,000 `raw_data` rows | 84.6 – 102.9 s | **28.8 – 31.7 s** | 2.9 – 3.3× |
+| 3,000,000 `raw_data` rows | 301.9 s | **123.0 s** | 2.45× |
 
 *These are local results, not official scores.* Hardware: Apple M3 Pro. The Linux
 server is an aarch64 VM with 6 vCPUs and 8 GB RAM, running PostgreSQL 16 (Docker
@@ -82,11 +83,20 @@ this exactly:
    foreign key is enforced by PostgreSQL as before. The row counter is updated in
    the same transaction as the rows it counts.
 
-`src/verify_outputs.py` (in the benchmark harness, see §6) checks the result. It
-compares md5 digests of every destination table ordered by primary key with all
-columns, plus the sequences, `pgdm_table_row_counts`, and the
-`table_versions` / `table_version_dependencies` rows. Result: **IDENTICAL** at 100k
-and 1M rows.
+`tools/challenge/verify_outputs.py` checks the result. It compares md5 digests of
+every destination table ordered by primary key with all columns, plus the sequences,
+`pgdm_table_row_counts`, and the `table_versions` / `table_version_dependencies`
+rows. Result: **IDENTICAL** at 100k and 1M rows.
+
+At 3M rows the original engine's own plan changes. Its joins with `table1` become
+multi-batch hash joins that spill to disk, and then it assigns the child tables'
+identity values in **hash-batch order** rather than source order. For example, the
+first `table5` ids point to raw rows 2, 4, 5, 6, 7, 9, … So its ids depend on memory
+settings and are not reproducible across servers, while this engine always assigns
+them in source order. A natural-key digest compares every row and every relation,
+with surrogate ids replaced by the `raw_id` they refer to. On that digest the two
+engines are **IDENTICAL at 3M** for all six tables: 3,000,000 / 3,000,000 /
+3,000,000 / 6,969,359 rows, plus 4 and 27 dimension rows.
 
 ### 2.4 Fewer round trips
 - **One SSH channel** carries the whole data pipeline as a single bash program. The
