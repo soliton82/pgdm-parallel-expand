@@ -1,5 +1,7 @@
 # PostgreSQL Data Manager
 
+> **Challenge solution:** this fork adds a parallel, resumable Expand engine with byte-identical output — see [CHALLENGE_SOLUTION.md](CHALLENGE_SOLUTION.md).
+
 PostgreSQL Data Manager is a desktop application for browsing and administering PostgreSQL databases through an SSH connection. It includes table previews, imports, version history, controlled destructive actions, data-dictionary tooling, dumps, restores, and role management.
 
 ## PostgreSQL setup
