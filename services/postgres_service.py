@@ -14045,8 +14045,20 @@ SELECT json_build_object(
             )
         return output
 
-    def execute_cross_table_expansion(self, *args, **kwargs) -> dict:
+    def _use_parallel_expand_engine(self) -> bool:
+        """Parallel staging only pays off with at least two server cores.
+
+        On a single core the extra staging pass makes it slower than the original
+        single-statement path (measured 234 s vs 176 s at 1M rows), so fall back.
+        """
         if EXPAND_ENGINE != "parallel" or not self.ssh_client:
+            return False
+        if EXPAND_RANGES.isdigit():
+            return True
+        return self._expand_parallel_ranges() >= 2
+
+    def execute_cross_table_expansion(self, *args, **kwargs) -> dict:
+        if not self._use_parallel_expand_engine():
             return self._execute_cross_table_expansion_impl(*args, **kwargs)
         # Read-only catalog checks of this expansion share one psql per database.
         sessions = {}
@@ -14232,7 +14244,7 @@ SELECT json_build_object(
         )
         self._raise_if_cancelled(cancel_event)
 
-        if EXPAND_ENGINE == "parallel":
+        if self._use_parallel_expand_engine():
             return self._execute_cross_table_expansion_parallel(
                 database_name,
                 prepared,
