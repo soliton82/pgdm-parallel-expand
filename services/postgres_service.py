@@ -19,6 +19,8 @@ import pandas as pd
 
 from services import psql_session
 from config import (
+    EXPAND_BULK_LOAD,
+    EXPAND_DECODE_FIELDS,
     EXPAND_CHUNK_ROWS,
     EXPAND_ENGINE,
     EXPAND_RANGES,
@@ -13929,6 +13931,8 @@ SELECT json_build_object(
                 tag=tag,
                 scope_key=scope_key,
                 workers=workers,
+                bulk_load=EXPAND_BULK_LOAD,
+                decode_fields=EXPAND_DECODE_FIELDS,
             )
         self._notify_progress(
             progress_callback,

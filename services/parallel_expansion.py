@@ -16,12 +16,18 @@ runs:
    GROUP BY / window / ORDER BY / LIMIT at the top level) is **staged**: K
    server-side sessions each run the recipe's SELECT over one contiguous
    ``raw_id`` range into an UNLOGGED staging table. Other recipes run inline.
-3. One transaction per phase then inserts the staged rows into the real
-   destination **in range order** (``UNION ALL`` of the ranges), so identity
-   values come out in the same order as the single-pass legacy run, and every
-   constraint, index and foreign key is enforced exactly as before. Row counters
-   and telemetry are updated through the same managed-DML wrapper as the legacy
-   engine, inside the same transaction as the rows they count.
+3. One transaction per phase then loads the staged rows into the real destination
+   with explicit ids from one pre-allocated identity block, in source order, so the
+   identity values are the same as in the single-pass legacy run. When a destination
+   is empty its FKs / UNIQUE constraints / secondary indexes / unreferenced PRIMARY
+   KEY are dropped for the load and re-created from their catalog definitions (and
+   re-validated) before the COMMIT, so the schema seen by every other session and
+   left after the commit is the official one (``bulk_load``; otherwise ``K``
+   parallel sessions insert with row-by-row checks). Row counters are updated in the
+   same transaction as the rows they count.
+4. Before a phase, destinations written by an earlier phase and read by this one get
+   planner statistics (``ANALYZE``), and a recipe that reads many JSON fields decodes
+   them once per source row (``decode_fields_once``).
 
 The whole pipeline is shipped as ONE bash script over ONE SSH channel; the
 PostgreSQL work never leaves the server. Staging wall time is measured on the
@@ -96,6 +102,54 @@ def split_statement(statement: str, source_sql: str):
     # Carry the source row key so the staged rows can be put back into source order.
     keyed = re.sub(r"^SELECT\b", f"SELECT {alias.group(1)}.raw_id AS pgdm_order_key,", select_sql, count=1, flags=re.IGNORECASE)
     return match.group("dest"), columns, keyed
+
+
+_DECODE_PREFIX = "pgdm_dec_"
+
+
+def _source_alias(select_sql: str, source_sql: str):
+    match = re.search(re.escape(source_sql) + r"\s+(?:AS\s+)?([A-Za-z_][A-Za-z0-9_]*)", select_sql, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def decode_fields_once(select_sql: str, source_sql: str, range_sql: str, enabled=True) -> str:
+    """Substitute the range source, decoding each ``raw -> 'values' ->> 'key'`` field ONCE per row.
+
+    The recipes read every field with ``src.raw -> 'values' ->> 'key'``; each such call copies
+    the whole ``values`` object out of the row before looking the key up, and a join condition
+    is evaluated once per candidate row (27 times per source row for table6). For a recipe that
+    reads many fields, or reads one inside a join condition, the source relation instead decodes
+    the referenced keys once per row with ``jsonb_to_record`` (text columns), and those calls
+    become plain column references. ``->>`` and a ``text`` column of ``jsonb_to_record`` return
+    the same text for every JSON value type (string, number, boolean, null, object, array) and
+    NULL for a missing key or a non-object ``values``; outputs are verified byte-identical.
+    Everything else in the recipe is unchanged, and the full source row stays available."""
+    plain = select_sql.replace(source_sql, range_sql)
+    alias = _source_alias(select_sql, source_sql) if enabled else None
+    if not alias:
+        return plain
+    pattern = re.compile(r"\b" + re.escape(alias) + r"\s*\.\s*raw\s*->\s*'values'\s*->>\s*'([A-Za-z0-9_]{1,50})'")
+    outside = select_sql.replace(source_sql, " ")
+    hits = list(pattern.finditer(outside))
+
+    def in_join_condition(position):
+        joins = [m.end() for m in re.finditer(r"\bJOIN\b", outside[:position], re.IGNORECASE)]
+        return bool(joins) and not re.search(r"\bWHERE\b", outside[joins[-1]:position], re.IGNORECASE)
+
+    if not hits or (len(hits) < 3 and not any(in_join_condition(m.start()) for m in hits)):
+        return plain
+    keys = list(dict.fromkeys(m.group(1) for m in hits))
+    columns = ", ".join(f'"{key}" text' for key in keys)
+    projection = ", ".join(f'pgdm_d."{key}" AS "{_DECODE_PREFIX}{key}"' for key in keys)
+    decoded_source = (
+        "(\n"
+        f"    SELECT pgdm_s.*, {projection}\n"
+        f"    FROM {range_sql} AS pgdm_s\n"
+        "    LEFT JOIN LATERAL jsonb_to_record(CASE WHEN jsonb_typeof(pgdm_s.raw -> 'values') = 'object' "
+        f"THEN pgdm_s.raw -> 'values' END) AS pgdm_d({columns}) ON true\n"
+        ")")
+    rewritten = pattern.sub(lambda m: f'{alias}."{_DECODE_PREFIX}{m.group(1)}"', select_sql.replace(source_sql, "\0"))
+    return rewritten.replace("\0", decoded_source)
 
 
 def _relation_key(name: str) -> str:
@@ -183,7 +237,8 @@ def _journal(step_key, job_id):
 
 def build_pipeline_script(service, *, database_name, source_schema_name, source_table_name,
                           raw_schemas, prepared_destinations, ranges, timing_table_sql,
-                          timing_result_sql, manifest_sql, job_id, tag, scope_key, workers=None):
+                          timing_result_sql, manifest_sql, job_id, tag, scope_key, workers=None,
+                          bulk_load=False, bulk_maintenance_work_mem="256MB", decode_fields=False):
     """Return (bash_script, phases, stage_tables) implementing the whole expansion.
 
     Every step is journalled in public.pgdm_expansion_job_steps in the same
@@ -362,8 +417,115 @@ COMMIT;"""
 
     from services.postgres_service import DATA_TABLE_ROW_COUNTS as service_counter_table
 
+    def bulk_load_sql(items):
+        """ONE transaction that loads every staged range of `items` into the destinations.
+
+        When a destination is empty at the start, its foreign keys, UNIQUE constraints, secondary
+        indexes and (if no foreign key points to it) its PRIMARY KEY are dropped, the rows are appended without per-row trigger/index
+        work, and every dropped object is re-created from its own catalog definition
+        (pg_get_constraintdef / pg_get_indexdef) and re-validated BEFORE the COMMIT. DDL is
+        transactional in PostgreSQL, so other sessions and any interrupted run only ever see
+        the official schema; a failed validation rolls the whole load back."""
+        dests = list(dict.fromkeys(item["split"][0] for item in items))
+        dest_array = "ARRAY[" + ", ".join(sql_literal(d) for d in dests) + "]::text[]"
+        body = ["BEGIN;",
+                "SET LOCAL client_min_messages = warning;",
+                "SET LOCAL max_parallel_workers_per_gather = 0;",
+                f"SET LOCAL maintenance_work_mem = '{bulk_maintenance_work_mem}';",
+                f"SET LOCAL max_parallel_maintenance_workers = {max(0, min(int(workers) - 1, 7))};",
+                "CREATE TEMP TABLE pgdm_bulk_defs (ord bigserial, rel regclass, kind text, name text, def text, note text) ON COMMIT DROP;",
+                f"""DO $pgdm_bulk_drop$
+DECLARE d text; r record; v_any boolean;
+BEGIN
+  FOREACH d IN ARRAY {dest_array} LOOP
+    -- Only the table owner may drop/re-create constraints; otherwise keep them (row checks).
+    CONTINUE WHEN NOT (SELECT pg_has_role(current_user, c.relowner, 'USAGE') FROM pg_class c WHERE c.oid = d::regclass);
+    EXECUTE format('LOCK TABLE %s IN ACCESS EXCLUSIVE MODE', d::regclass);
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM %s)', d::regclass) INTO v_any;
+    CONTINUE WHEN v_any;  -- non-empty destination: keep every constraint (row-by-row checks)
+    -- Every table a dropped FK points to must accept the re-created FK (REFERENCES right).
+    CONTINUE WHEN EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conrelid = d::regclass AND c.contype = 'f'
+                          AND NOT has_table_privilege(c.confrelid, 'REFERENCES'));
+    -- UNIQUE constraints no foreign key depends on, then FKs, then plain secondary indexes.
+    INSERT INTO pg_temp.pgdm_bulk_defs (rel, kind, name, def, note)
+    SELECT c.conrelid, CASE c.contype WHEN 'p' THEN '0_pkey' WHEN 'u' THEN '1_unique' ELSE '3_fkey' END, c.conname,
+           pg_get_constraintdef(c.oid), obj_description(c.oid, 'pg_constraint')
+    FROM pg_constraint c
+    WHERE c.conrelid = d::regclass AND c.contype IN ('p', 'u', 'f')
+      -- a PRIMARY KEY / UNIQUE constraint that a foreign key points to stays in place
+      AND NOT (c.contype IN ('p', 'u') AND EXISTS (SELECT 1 FROM pg_constraint f WHERE f.contype = 'f' AND f.conindid = c.conindid))
+    ORDER BY c.contype DESC, c.conname;
+    INSERT INTO pg_temp.pgdm_bulk_defs (rel, kind, name, def, note)
+    SELECT i.indrelid, '2_index', ci.relname, pg_get_indexdef(i.indexrelid), obj_description(i.indexrelid, 'pg_class')
+    FROM pg_index i JOIN pg_class ci ON ci.oid = i.indexrelid
+    WHERE i.indrelid = d::regclass AND NOT i.indisprimary AND NOT i.indisclustered AND NOT i.indisreplident
+      AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid)
+    ORDER BY ci.relname;
+    FOR r IN SELECT * FROM pg_temp.pgdm_bulk_defs WHERE rel = d::regclass ORDER BY kind DESC, ord LOOP
+      IF r.kind = '2_index' THEN
+        EXECUTE format('DROP INDEX %s', (SELECT format('%I.%I', n.nspname, r.name) FROM pg_class t
+                       JOIN pg_namespace n ON n.oid = t.relnamespace WHERE t.oid = r.rel));
+      ELSE
+        EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.rel, r.name);
+      END IF;
+    END LOOP;
+  END LOOP;
+END $pgdm_bulk_drop$;"""]
+        for item in items:
+            for k in range(ranges):
+                inner = insert_sql(item, k).splitlines()
+                body += [line for line in inner if line not in (
+                    "BEGIN;", "COMMIT;", "SET LOCAL client_min_messages = warning;",
+                    "SET LOCAL max_parallel_workers_per_gather = 0;")]
+        body += ["""DO $pgdm_bulk_rebuild$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT * FROM pg_temp.pgdm_bulk_defs ORDER BY kind, ord LOOP
+    IF r.kind = '2_index' THEN
+      EXECUTE r.def;
+      IF r.note IS NOT NULL THEN
+        EXECUTE format('COMMENT ON INDEX %s IS %L', (SELECT format('%I.%I', n.nspname, r.name) FROM pg_class t
+                       JOIN pg_namespace n ON n.oid = t.relnamespace WHERE t.oid = r.rel), r.note);
+      END IF;
+    ELSE
+      EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s', r.rel, r.name, r.def);
+      IF r.note IS NOT NULL THEN
+        EXECUTE format('COMMENT ON CONSTRAINT %I ON %s IS %L', r.name, r.rel, r.note);
+      END IF;
+    END IF;
+  END LOOP;
+END $pgdm_bulk_rebuild$;"""]
+        key = "bulk:" + "+".join(f"{i['destination']['table_name']}:{i['statement_index']}" for i in items)
+        body += [_journal(key, job_id), "COMMIT;"]
+        return _guarded(key, job_id, body)
+
+    written_before = set()
     for phase_number, phase in enumerate(phases, start=1):
         staged = [item for item in phase if item["split"]]
+        # --- 0. planner statistics: a destination filled by an earlier phase and read by this
+        #        phase's recipes has no statistics yet (autovacuum has not seen it). With no
+        #        stats the planner puts the 4-row table3 on the OUTER side of table1's join and
+        #        rescans every raw chunk once per dimension row. ANALYZE is statistics only (the
+        #        rows and the source-ordered ids are unchanged); tables that already carry a
+        #        large row estimate (set by an index build) are skipped to save time.
+        reads = sorted({_relation_key(f"{s}.{t}") for item in staged
+                        for s, t in item["destination"].get("read_relations") or []} & written_before)
+        if reads:
+            array = "ARRAY[" + ", ".join(sql_literal(r) for r in reads) + "]::text[]"
+            timed_block("Refresh planner statistics for " + ", ".join(reads), [
+                "$PGDM_PSQL >/dev/null <<'PGDM_ANALYZE_SQL' || exit 4",
+                "SET client_min_messages = warning;",
+                f"""DO $pgdm_analyze$
+DECLARE r text;
+BEGIN
+  FOREACH r IN ARRAY {array} LOOP
+    IF (SELECT reltuples < 100000 FROM pg_class WHERE oid = r::regclass) THEN
+      EXECUTE format('ANALYZE %s', r::regclass);
+    END IF;
+  END LOOP;
+END $pgdm_analyze$;""",
+                "PGDM_ANALYZE_SQL"])
+        written_before |= {_relation_key(item["destination"]["table_name"]) for item in phase}
         # --- 1. parallel staging: one session per raw_id range, every staged recipe of the phase
         if staged:
             for item in staged:
@@ -384,8 +546,10 @@ COMMIT;"""
                     _, columns, select_sql = item["split"]
                     alias = ", ".join(f"pgdm_c{i}" for i in range(len(columns)))
                     plain = ", ".join(f"pgdm_q.pgdm_c{i}" for i in range(len(columns)))
-                    select_k = select_sql.replace(
-                        source_sql, _range_source_sql(source_schema_name, source_table_name, raw_schemas, k, ranges))
+                    select_k = decode_fields_once(
+                        select_sql, source_sql,
+                        _range_source_sql(source_schema_name, source_table_name, raw_schemas, k, ranges),
+                        enabled=decode_fields)
                     stage = item["stage_tables"][k]
                     key = f"stage:{item['destination']['table_name']}:{item['statement_index']}:{k}"
                     sql += _guarded(key, job_id, [
@@ -461,11 +625,18 @@ COMMIT;"""
                                                       f"{sql_literal(item['split'][0])} AND statement_index = {item['statement_index']})")
             alloc_body = ["$PGDM_PSQL >/dev/null <<'PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL' || exit 6",
                           *alloc_sql, "PGDM_ALLOCATE_" + str(state["sequence"]) + "_SQL"]
-            scripts = [[insert_sql(item, k) for k in chunks_of[w] for item in items] for w in range(workers)]
-            body, check = parallel(scripts, 7, "INSERT")
-            timed_block(f"Insert into {names} in {workers} parallel sessions (source-ordered id blocks)",
-                        alloc_body + body)
-            lines.append(check)
+            if bulk_load:
+                delimiter = f"PGDM_BULK_{state['sequence']}_SQL"
+                timed_block(f"Load {names} in one transaction (source-ordered id blocks; constraints "
+                            "re-created and validated before commit)",
+                            alloc_body + [f"$PGDM_PSQL >/dev/null <<'{delimiter}' || exit 7",
+                                          "SET client_min_messages = warning;", *bulk_load_sql(items), delimiter])
+            else:
+                scripts = [[insert_sql(item, k) for k in chunks_of[w] for item in items] for w in range(workers)]
+                body, check = parallel(scripts, 7, "INSERT")
+                timed_block(f"Insert into {names} in {workers} parallel sessions (source-ordered id blocks)",
+                            alloc_body + body)
+                lines.append(check)
             report = []
             for item in items:
                 dest = item["split"][0]

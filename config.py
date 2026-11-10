@@ -29,3 +29,10 @@ EXPAND_ENGINE = _environment_value("PDM_EXPAND_ENGINE", "parallel").lower()
 EXPAND_RANGES = _environment_value("PDM_EXPAND_RANGES", "auto").lower()
 # Target source rows per chunk; workers process chunks round-robin (PDM_EXPAND_CHUNK_ROWS).
 EXPAND_CHUNK_ROWS = max(10000, int(_environment_value("PDM_EXPAND_CHUNK_ROWS", "250000")))
+# Load each phase's staged rows in ONE transaction that drops the destination's FKs / UNIQUE
+# constraints / secondary indexes when it is empty and re-creates + re-validates them before
+# COMMIT ("on", default), or insert with N parallel sessions and row-by-row checks ("off").
+EXPAND_BULK_LOAD = _environment_value("PDM_EXPAND_BULK_LOAD", "on").lower() not in ("0", "off", "false", "no")
+# Decode a staged recipe's raw -> 'values' ->> 'key' fields once per source row with
+# jsonb_to_record ("on", default) or evaluate every reference as written ("off").
+EXPAND_DECODE_FIELDS = _environment_value("PDM_EXPAND_DECODE_FIELDS", "on").lower() not in ("0", "off", "false", "no")
